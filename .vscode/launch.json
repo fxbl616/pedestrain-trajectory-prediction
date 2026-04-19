@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Trainval (run trainval.py)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/trainval.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "--test_set", "hotel",
+                "--start_test", "10"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            },
+            "justMyCode": false,
+            "redirectOutput": true
+        },
+        {
+            "name": "Attach to trainval",
+            "type": "debugpy",
+            "request": "attach",
+            "connect": { "host": "localhost", "port": 6789 },
+            "justMyCode": false
+        },
+
+    ]
+}

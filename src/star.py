@@ -1,0 +1,651 @@
+import copy
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.models as models
+from .multi_attention_forward import multi_head_attention_forward
+from .vit import ViTSceneEncoder
+
+def get_noise(shape, noise_type):
+    if noise_type == "gaussian":
+        return torch.randn(shape).cuda()
+    elif noise_type == "uniform":
+        return torch.rand(*shape).sub_(0.5).mul(2.0).cuda()
+    raise ValueError('Unrecognized noise type "%s"' % noise_type)
+
+
+def get_subsequent_mask(seq):
+    ''' For masking out the subsequent info. '''
+    sz_b, len_s = seq.size()
+    subsequent_mask = (1 - torch.triu(
+        torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
+    return subsequent_mask
+
+
+def _get_activation_fn(activation):
+    if activation == "relu":
+        return F.relu
+    elif activation == "gelu":
+        return F.gelu
+    else:
+        raise RuntimeError("activation should be relu/gelu, not %s." % activation)
+
+
+def _get_clones(module, N):
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+class MultiheadAttention(nn.Module):
+    r"""Allows the model to jointly attend to information
+    from different representation subspaces.
+    See reference: Attention Is All You Need
+    .. math::
+        \text{MultiHead}(Q, K, V) = \text{Concat}(head_1,\dots,head_h)W^O
+        \text{where} head_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)
+    Args:
+        embed_dim: total dimension of the model.
+        num_heads: parallel attention heads.
+        dropout: a Dropout layer on attn_output_weights. Default: 0.0.
+        bias: add bias as module parameter. Default: True.
+        add_bias_kv: add bias to the key and value sequences at dim=0.
+        add_zero_attn: add a new batch of zeros to the key and
+                       value sequences at dim=1.
+        kdim: total number of features in key. Default: None.
+        vdim: total number of features in key. Default: None.
+        Note: if kdim and vdim are None, they will be set to embed_dim such that
+        query, key, and value have the same number of features.
+    Examples::
+        >>> multihead_attn = nn.MultiheadAttention(embed_dim, num_heads)
+        >>> attn_output, attn_output_weights = multihead_attn(query, key, value)
+    """
+    __constants__ = ['q_proj_weight', 'k_proj_weight', 'v_proj_weight', 'in_proj_weight']
+
+    def __init__(self, embed_dim, num_heads, dropout=0., bias=True, add_bias_kv=False, add_zero_attn=False, kdim=None,
+                 vdim=None):
+        super(MultiheadAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.kdim = kdim if kdim is not None else embed_dim
+        self.vdim = vdim if vdim is not None else embed_dim
+        self._qkv_same_embed_dim = self.kdim == embed_dim and self.vdim == embed_dim
+
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == self.embed_dim, "embed_dim must be divisible by num_heads"
+
+        if self._qkv_same_embed_dim is False:
+            self.q_proj_weight = nn.Parameter(torch.Tensor(embed_dim, embed_dim))
+            self.k_proj_weight = nn.Parameter(torch.Tensor(embed_dim, self.kdim))
+            self.v_proj_weight = nn.Parameter(torch.Tensor(embed_dim, self.vdim))
+            self.register_parameter('in_proj_weight', None)
+        else:
+            self.in_proj_weight = nn.Parameter(torch.empty(3 * embed_dim, embed_dim))
+            self.register_parameter('q_proj_weight', None)
+            self.register_parameter('k_proj_weight', None)
+            self.register_parameter('v_proj_weight', None)
+
+        if bias:
+            self.in_proj_bias = nn.Parameter(torch.empty(3 * embed_dim))
+        else:
+            self.register_parameter('in_proj_bias', None)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        if add_bias_kv:
+            self.bias_k = nn.Parameter(torch.empty(1, 1, embed_dim))
+            self.bias_v = nn.Parameter(torch.empty(1, 1, embed_dim))
+        else:
+            self.bias_k = self.bias_v = None
+
+        self.add_zero_attn = add_zero_attn
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        if self._qkv_same_embed_dim:
+            nn.init.xavier_uniform_(self.in_proj_weight)
+        else:
+            nn.init.xavier_uniform_(self.q_proj_weight)
+            nn.init.xavier_uniform_(self.k_proj_weight)
+            nn.init.xavier_uniform_(self.v_proj_weight)
+
+        if self.in_proj_bias is not None:
+            nn.init.constant_(self.in_proj_bias, 0.)
+            nn.init.constant_(self.out_proj.bias, 0.)
+        if self.bias_k is not None:
+            nn.init.xavier_normal_(self.bias_k)
+        if self.bias_v is not None:
+            nn.init.xavier_normal_(self.bias_v)
+
+    def __setstate__(self, state):
+        # Support loading old MultiheadAttention checkpoints generated by v1.1.0
+        if '_qkv_same_embed_dim' not in state:
+            state['_qkv_same_embed_dim'] = True
+
+        super(MultiheadAttention, self).__setstate__(state)
+
+    def forward(self, query, key, value, key_padding_mask=None,
+                need_weights=True, attn_mask=None):
+        # type: (Tensor, Tensor, Tensor, Optional[Tensor], bool, Optional[Tensor]) -> Tuple[Tensor, Optional[Tensor]]
+        r"""
+    Args:
+        query, key, value: map a query and a set of key-value pairs to an output.
+            See "Attention Is All You Need" for more details.
+        key_padding_mask: if provided, specified padding elements in the key will
+            be ignored by the attention. This is an binary mask. When the value is True,
+            the corresponding value on the attention layer will be filled with -inf.
+        need_weights: output attn_output_weights.
+        attn_mask: mask that prevents attention to certain positions. This is an additive mask
+            (i.e. the values will be added to the attention layer).
+    Shape:
+        - Inputs:
+        - query: :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is
+          the embedding dimension.
+        - key: :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is
+          the embedding dimension.
+        - value: :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is
+          the embedding dimension.
+        - key_padding_mask: :math:`(N, S)`, ByteTensor, where N is the batch size, S is the source sequence length.
+        - attn_mask: :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
+        - Outputs:
+        - attn_output: :math:`(L, N, E)` where L is the target sequence length, N is the batch size,
+          E is the embedding dimension.
+        - attn_output_weights: :math:`(N, L, S)` where N is the batch size,
+          L is the target sequence length, S is the source sequence length.
+        """
+        if not self._qkv_same_embed_dim:
+            return multi_head_attention_forward(
+                query, key, value, self.embed_dim, self.num_heads,
+                self.in_proj_weight, self.in_proj_bias,
+                self.bias_k, self.bias_v, self.add_zero_attn,
+                self.dropout, self.out_proj.weight, self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask, need_weights=need_weights,
+                attn_mask=attn_mask, use_separate_proj_weight=True,
+                q_proj_weight=self.q_proj_weight, k_proj_weight=self.k_proj_weight,
+                v_proj_weight=self.v_proj_weight)
+        else:
+            return multi_head_attention_forward(
+                query, key, value, self.embed_dim, self.num_heads,
+                self.in_proj_weight, self.in_proj_bias,
+                self.bias_k, self.bias_v, self.add_zero_attn,
+                self.dropout, self.out_proj.weight, self.out_proj.bias,
+                training=self.training,
+                key_padding_mask=key_padding_mask, need_weights=need_weights,
+                attn_mask=attn_mask)
+
+
+class TransformerEncoderLayer(nn.Module):
+
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0, activation="relu"):
+        super(TransformerEncoderLayer, self).__init__()
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = _get_activation_fn(activation)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        r"""Pass the input through the encoder layer.
+
+        Args:
+            src: the sequnce to the encoder layer (required).
+            src_mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        src2, attn = self.self_attn(src, src, src, attn_mask=src_mask,
+                                    key_padding_mask=src_key_padding_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+
+        if hasattr(self, "activation"):
+            src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        else:  # for backward compatibility
+            src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src, attn
+
+
+class TransformerEncoder(nn.Module):
+    r"""TransformerEncoder is a stack of N encoder layers
+
+    Args:
+        encoder_layer: an instance of the TransformerEncoderLayer() class (required).
+        num_layers: the number of sub-encoder-layers in the encoder (required).
+        norm: the layer normalization component (optional).
+
+    Examples::
+        >>> encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        >>> transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=6)
+        >>> src = torch.rand(10, 32, 512)
+        >>> out = transformer_encoder(src)
+    """
+
+    def __init__(self, encoder_layer, num_layers, norm=None):
+        super(TransformerEncoder, self).__init__()
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src, mask=None, src_key_padding_mask=None):
+        r"""Pass the input through the encoder layers in turn.
+
+        Args:
+            src: the sequnce to the encoder (required).
+            mask: the mask for the src sequence (optional).
+            src_key_padding_mask: the mask for the src keys per batch (optional).
+
+        Shape:
+            see the docs in Transformer class.
+        """
+        output = src
+
+        atts = []
+
+        for i in range(self.num_layers):
+            output, attn = self.layers[i](output, src_mask=mask,
+                                          src_key_padding_mask=src_key_padding_mask)
+            atts.append(attn)
+        if self.norm:
+            output = self.norm(output)
+
+        return output
+
+
+class TransformerModel(nn.Module):
+
+    def __init__(self, ninp, nhead, nhid, nlayers, dropout=0.5):
+        super(TransformerModel, self).__init__()
+        self.model_type = 'Transformer'
+        self.src_mask = None
+        encoder_layers = TransformerEncoderLayer(ninp, nhead, nhid, dropout)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, nlayers)
+        self.ninp = ninp
+
+    def forward(self, src, mask):
+        n_mask = mask + torch.eye(mask.shape[0], mask.shape[0]).cuda()
+        n_mask = n_mask.float().masked_fill(n_mask == 0., float(-1e20)).masked_fill(n_mask == 1., float(0.0))
+        output = self.transformer_encoder(src, mask=n_mask)
+
+        return output
+
+
+class STAR(torch.nn.Module):
+
+    def __init__(self, args, dropout_prob=0):
+        super(STAR, self).__init__()
+
+        # set parameters for network architecture
+        self.embedding_size = [32]
+        self.output_size = 2
+        self.dropout_prob = dropout_prob
+        self.args = args
+
+        self.temporal_encoder_layer = TransformerEncoderLayer(d_model=32, nhead=8)
+
+        emsize = 32  # embedding dimension
+        nhid = 2048  # the dimension of the feedforward network model in TransformerEncoder
+        nlayers = 2  # the number of nn.TransformerEncoderLayer in nn.TransformerEncoder
+        nhead = 8  # the number of heads in the multihead-attention models
+        dropout = 0.1  # the dropout value
+
+        self.spatial_encoder_1 = TransformerModel(emsize, nhead, nhid, nlayers, dropout)
+        self.spatial_encoder_2 = TransformerModel(emsize, nhead, nhid, nlayers, dropout)
+
+        self.temporal_encoder_1 = TransformerEncoder(self.temporal_encoder_layer, 1)
+        self.temporal_encoder_2 = TransformerEncoder(self.temporal_encoder_layer, 1)
+
+        # Linear layer to map input to embedding
+        self.input_embedding_layer_temporal = nn.Linear(2, 32)
+        self.input_embedding_layer_spatial = nn.Linear(2, 32)
+        # self.vit_dim = 64
+        self.vit_dim = 32
+        # Linear layer to output and fusion
+        # self.output_layer = nn.Linear(48 + self.vit_dim, 2)
+        # [新增] 初始化 ViT
+        
+        self.scene_encoder = ViTSceneEncoder(embedding_dim=self.vit_dim,
+            embed_dim=256,      # 减小维度，防止过拟合 (原来是768)
+            num_layers=4,       # 减少层数 (原来是12)
+            num_heads=4,        # 减少头数
+            freeze_vit=True,   # 冻结预训练权重
+            use_multi_scale=True)
+
+        # [修改] Fusion Layer: Temporal(32) + Spatial(32) = 64
+        self.fusion_layer = nn.Linear(32 + 32, 32)
+        # self.fusion_layer = nn.Linear(64, 32)
+        # --- [2] 融合模块：Transformer Fusion (模仿 SceneAware) ---
+        # 输入维度 = Temporal(32) + Scene(64) + Noise(16) = 112
+        # 我们需要定义一个新的 Transformer Encoder 来做融合
+        self.fusion_dim = 32 
+        # self.scene_projector = nn.Sequential(
+        #     nn.Linear(self.vit_dim, 32),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.1)
+        # )
+
+        # # B. 模态位置编码 (Modality Embedding)
+        # # 告诉 Transformer 哪一个是"运动"，哪一个是"场景"
+        # # 这是一个可学习的参数 (2, 1, 32) -> 2个token，broadcast batch，32维
+        # self.modality_token = nn.Parameter(torch.randn(2, 1, 32))
+        
+        # # C. 融合 Transformer
+        # # 定义融合用的 Transformer 层
+        # # 注意：d_model 必须能被 nhead 整除。112 / 8 = 14 (可以整除)
+        # fusion_encoder_layer = TransformerEncoderLayer(
+        #     d_model=self.fusion_dim, 
+        #     nhead=4, 
+        #     dim_feedforward=128, 
+        #     dropout=0.1
+        # )
+         # 堆叠层数：SceneAware 用了 3 层，这里我们用 1-2 层即可，防止过拟合
+        # self.fusion_decoder = TransformerEncoder(fusion_encoder_layer, num_layers=1)
+
+          # --- [2] 原来的 Transformer Fusion 改为 Cross-Attention 融合 ---
+      
+        # 删除 modality_token 和 TransformerEncoderLayer，改用交叉注意力
+        # embed_dim 对应特征维度 32，num_heads 设为 4
+        # self.cross_attn = nn.MultiheadAttention(embed_dim=self.fusion_dim, num_heads=4, dropout=0.1)
+        # self.cross_attn_norm = nn.LayerNorm(self.fusion_dim)
+        
+        self.scene_gate = nn.Sequential(
+            nn.Linear(self.vit_dim + 32, self.vit_dim),
+            nn.Sigmoid()
+        )
+# self.motion_gate = nn.Sequential(
+#     nn.Linear(self.vit_dim + 32, self.vit_dim),
+#     nn.Sigmoid()
+# )
+        # --- [3] 输出层 ---
+        # 经过 Transformer 后维度依然是 112，最后映射到 2
+        self.output_layer = nn.Linear(32+16, 2)
+        # ReLU and dropout init
+        self.relu = nn.ReLU()
+        self.dropout_in = nn.Dropout(self.dropout_prob)
+        self.dropout_in2 = nn.Dropout(self.dropout_prob)
+
+    def get_st_ed(self, batch_num):
+        """
+
+        :param batch_num: contains number of pedestrians in different scenes for a batch
+        :type batch_num: list
+        :return: st_ed: list of tuple contains start index and end index of pedestrians in different scenes
+        :rtype: list
+        """
+        cumsum = torch.cumsum(batch_num, dim=0)
+        st_ed = []
+        for idx in range(1, cumsum.shape[0]):
+            st_ed.append((int(cumsum[idx - 1]), int(cumsum[idx])))
+
+        st_ed.insert(0, (0, int(cumsum[0])))
+
+        return st_ed
+
+    def get_node_index(self, seq_list):
+        """
+
+        :param seq_list: mask indicates whether pedestrain exists
+        :type seq_list: numpy array [F, N], F: number of frames. N: Number of pedestrians (a mask to indicate whether
+                                                                                            the pedestrian exists)
+        :return: All the pedestrians who exist from the beginning to current frame
+        :rtype: numpy array
+        """
+        for idx, framenum in enumerate(seq_list):
+
+            if idx == 0:
+                node_indices = framenum > 0
+            else:
+                node_indices *= (framenum > 0)
+
+        return node_indices
+
+    def update_batch_pednum(self, batch_pednum, ped_list):
+        """
+
+        :param batch_pednum: batch_num: contains number of pedestrians in different scenes for a batch
+        :type list
+        :param ped_list: mask indicates whether the pedestrian exists through the time window to current frame
+        :type tensor
+        :return: batch_pednum: contains number of pedestrians in different scenes for a batch after removing pedestrian who disappeared
+        :rtype: list
+        """
+        updated_batch_pednum_ = copy.deepcopy(batch_pednum).cpu().numpy()
+        updated_batch_pednum = copy.deepcopy(batch_pednum)
+
+        cumsum = np.cumsum(updated_batch_pednum_)
+        new_ped = copy.deepcopy(ped_list).cpu().numpy()
+
+        for idx, num in enumerate(cumsum):
+            num = int(num)
+            if idx == 0:
+                updated_batch_pednum[idx] = len(np.where(new_ped[0:num] == 1)[0])
+            else:
+                updated_batch_pednum[idx] = len(np.where(new_ped[int(cumsum[idx - 1]):num] == 1)[0])
+
+        return updated_batch_pednum
+
+    def mean_normalize_abs_input(self, node_abs, st_ed):
+        """
+
+        :param node_abs: Absolute coordinates of pedestrians
+        :type Tensor
+        :param st_ed: list of tuple indicates the indices of pedestrians belonging to the same scene
+        :type List of tupule
+        :return: node_abs: Normalized absolute coordinates of pedestrians
+        :rtype: Tensor
+        """
+        node_abs = node_abs.permute(1, 0, 2)
+        for st, ed in st_ed:
+            mean_x = torch.mean(node_abs[st:ed, :, 0])
+            mean_y = torch.mean(node_abs[st:ed, :, 1])
+
+            node_abs[st:ed, :, 0] = (node_abs[st:ed, :, 0] - mean_x)
+            node_abs[st:ed, :, 1] = (node_abs[st:ed, :, 1] - mean_y)
+
+        return node_abs.permute(1, 0, 2)
+
+    def forward(self, inputs, iftest=False):
+       
+        # 4. 数据解包
+        if len(inputs) == 8:
+            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum, scene_img = inputs
+        else:
+            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum = inputs[:7]
+            scene_img = None
+        num_Ped = nodes_norm.shape[1]
+
+        outputs = torch.zeros(nodes_norm.shape[0], num_Ped, 2).cuda()
+        GM = torch.zeros(nodes_norm.shape[0], num_Ped, 32).cuda()
+
+        noise = get_noise((1, 16), 'gaussian')
+        # [新增] 提取场景特征
+        # scene_img shape: (1, 3, 224, 224) -> feature: (1, 64)
+        # 5. ViT 前向传播
+        if scene_img is not None:
+            if scene_img.device != nodes_abs.device:
+                scene_img = scene_img.to(nodes_abs.device)
+            
+            # 这里的 scene_encoder 就是 vit.py 里的适配版
+            
+            # batch_scene_feat = self.scene_encoder(scene_img) # (Batch, 64)
+            # ViT 前向（全局特征）
+            # # 广播到每个行人
+            if isinstance(batch_pednum, list):
+                bp_tensor = torch.tensor(batch_pednum).to(nodes_abs.device)
+            else:
+                bp_tensor = batch_pednum.to(nodes_abs.device)
+            batch_seq_len = len(bp_tensor) # 当前 batch 有多少个序列 (例如 14)
+                
+            batch_scene_feat = self.scene_encoder(scene_img)  # (1, 32)
+            # 广播到每个场景的行人
+            if batch_scene_feat.size(0) == 1 and batch_seq_len > 1:
+                batch_scene_feat = batch_scene_feat.repeat(batch_seq_len, 1)  # (num_scenes, 32)
+            current_scene_feat_all = torch.repeat_interleave(
+                batch_scene_feat, bp_tensor.long(), dim=0
+            )  # (num_Ped, 32)
+            
+            # if batch_scene_feat.size(0) == 1 and batch_seq_len > 1:
+            #     # 把 (1, 64) -> (14, 64)
+            #     batch_scene_feat = batch_scene_feat.repeat(batch_seq_len, 1, 1, 1)
+            # current_scene_feat_all = torch.repeat_interleave(batch_scene_feat, bp_tensor.long(), dim=0)
+        else:
+            # current_scene_feat_all = torch.zeros(num_Ped, self.vit_dim, 14, 14).cuda()
+            current_scene_feat_all = torch.zeros(num_Ped, self.vit_dim).cuda()
+        for framenum in range(self.args.seq_length - 1):
+
+            if framenum >= self.args.obs_length and iftest:
+
+                node_index = self.get_node_index(seq_list[:self.args.obs_length])
+                updated_batch_pednum = self.update_batch_pednum(batch_pednum, node_index)
+                st_ed = self.get_st_ed(updated_batch_pednum)
+
+                nodes_current = outputs[self.args.obs_length - 1:framenum, node_index]
+                nodes_current = torch.cat((nodes_norm[:self.args.obs_length, node_index], nodes_current))
+                node_abs_base = nodes_abs[:self.args.obs_length, node_index]
+                node_abs_pred = shift_value[self.args.obs_length:framenum + 1, node_index] + outputs[
+                                                                                           self.args.obs_length - 1:framenum,
+                                                                                           node_index]
+                node_abs = torch.cat((node_abs_base, node_abs_pred), dim=0)
+                # We normalize the absolute coordinates using the mean value in the same scene
+                node_abs = self.mean_normalize_abs_input(node_abs, st_ed)
+                # 更新当前有效的行人场景特征
+                # current_scene_feat = current_scene_feat_all[node_index]
+
+            else:
+                node_index = self.get_node_index(seq_list[:framenum + 1])
+                nei_list = nei_lists[framenum, node_index, :]
+                nei_list = nei_list[:, node_index]
+                updated_batch_pednum = self.update_batch_pednum(batch_pednum, node_index)
+                st_ed = self.get_st_ed(updated_batch_pednum)
+                nodes_current = nodes_norm[:framenum + 1, node_index]
+                # We normalize the absolute coordinates using the mean value in the same scene
+                node_abs = self.mean_normalize_abs_input(nodes_abs[:framenum + 1, node_index], st_ed)
+                # 更新当前有效的行人场景特征
+                # current_scene_feat = current_scene_feat_all[node_index]
+            # Input Embedding
+            if framenum == 0:
+                temporal_input_embedded = self.dropout_in(self.relu(self.input_embedding_layer_temporal(nodes_current)))
+            else:
+                temporal_input_embedded = self.dropout_in(self.relu(self.input_embedding_layer_temporal(nodes_current)))
+                temp_emb = temporal_input_embedded.clone()
+                temp_emb[:framenum] = GM[:framenum, node_index]
+                temporal_input_embedded = temp_emb
+                # temporal_input_embedded[:framenum] = GM[:framenum, node_index]
+
+            spatial_input_embedded_ = self.dropout_in2(self.relu(self.input_embedding_layer_spatial(node_abs)))
+
+            spatial_input_embedded = self.spatial_encoder_1(spatial_input_embedded_[-1].unsqueeze(1), nei_list)
+
+            spatial_input_embedded = spatial_input_embedded.permute(1, 0, 2)[-1]
+            temporal_input_embedded_last = self.temporal_encoder_1(temporal_input_embedded)[-1]
+
+            temporal_input_embedded = temporal_input_embedded[:-1]
+
+            # [修改] 融合场景特征
+            fusion_feat = torch.cat((
+                temporal_input_embedded_last, 
+                spatial_input_embedded
+                
+            ), dim=1)
+            fusion_feat = self.fusion_layer(fusion_feat)
+
+            spatial_input_embedded = self.spatial_encoder_2(fusion_feat.unsqueeze(1), nei_list)
+            spatial_input_embedded = spatial_input_embedded.permute(1, 0, 2)
+
+            temporal_input_embedded = torch.cat((temporal_input_embedded, spatial_input_embedded), dim=0)
+            temporal_input_embedded = self.temporal_encoder_2(temporal_input_embedded)[-1]
+            # =======================================================
+            # [关键修改] 序列化 Transformer 融合
+            # =======================================================
+            
+            #  1. 拿到当前帧所有有效行人的绝对坐标
+            # node_abs 的 shape 原本是 (N_curr, 2)，包含了真实世界的坐标(米单位)
+            # curr_abs_pos = node_abs[-1]  # 取当前最新一帧的位置: (N_curr, 2)
+            
+            # # ❗重要：grid_sample 需要的是 [-1, 1] 范围的相对坐标
+            # # 如果你有真实数据集的单应性矩阵 (Homography)，在这里转化最准。
+            # # 如果没有，用简单的标准化映射代替 (假设场景对角坐标是从 -10米 到 10米)
+            # # 你可以根据你数据集的实际范围调整 15.0 这个缩放超参
+            # grid_coords = curr_abs_pos / 15.0  
+            # grid_coords = torch.clamp(grid_coords, min=-1.0, max=1.0)
+            
+            # # 把它 reshape 成 grid_sample 要求的格式: (N_curr, 1(H), 1(W), 2(x,y))
+            # grid = grid_coords.view(-1, 1, 1, 2)
+            
+            # # 2. 给每个行人采样他脚下的局部场景特征
+            # # current_scene_feat 是 (N_curr, 64, 14, 14)
+            # # 采样后 sampled_feat 为 (N_curr, 64, 1, 1)
+            # sampled_feat = F.grid_sample(current_scene_feat, grid, align_corners=True)
+            # local_scene_feat = sampled_feat.view(-1, self.vit_dim) # (N_curr, 64)
+            
+            # # 3. 投影到 32 维
+            # scene_feat_proj = self.scene_projector(local_scene_feat)
+            # # 1. 投影场景特征 (N_curr, 64) -> (N_curr, 32)
+            # # scene_feat_proj = self.scene_projector(current_scene_feat)
+            
+            # # # 2. 构建序列: [Motion_Token, Scene_Token]
+            # # # temporal_final_feat: (N, 32)
+            # # # scene_feat_proj:     (N, 32)
+            # # # Stack 后 -> (2, N, 32)
+            # # seq_feat = torch.stack([temporal_input_embedded, scene_feat_proj], dim=0)
+            
+            # # # 3. 加上模态 Embedding (广播相加)
+            # # # self.modality_token: (2, 1, 32)
+            # # seq_feat = seq_feat + self.modality_token
+            # # # 4. 进入 Transformer (交互)
+            # # # 输出: (2, N, 32)
+            # # fused_seq = self.fusion_decoder(seq_feat)
+            
+            # # # 5. 取出第一个 Token (即被场景信息修正过的 Motion Token)
+            # # # (N, 32)
+            # # final_motion_feat = fused_seq[0]
+            
+            #  # 2. 准备 Q, K, V 输入
+            # # PyTorch 默认机制 demands 维度为 (Seq_len, Batch, Dim) 
+            # # 这里 Batch 就看作是当前的行人数 (node_index 选出来的 N_curr)
+            # # Seq_len 我们设为 1 (每个行人1个运动Token, 1个场景Token)
+            
+            # # Query: 行人的时空运动特征 -> (1, N_curr, 32)
+            # query = temporal_input_embedded.unsqueeze(0) 
+            
+            # # Key & Value: 场景特征 -> (1, N_curr, 32)
+            # scene_kv = scene_feat_proj.unsqueeze(0)
+            
+            # # 3. 交叉注意力交互: 运动查场景
+            # # attn_output: (1, N_curr, 32)
+            # attn_output, _ = self.cross_attn(query, scene_kv, scene_kv)
+            
+            # 4. 残差连接(Residual) + 标准化
+            # 意味着：最终特征 = 原本运动惯性 + 场景反馈信息
+            # final_motion_feat = temporal_input_embedded + attn_output.squeeze(0)
+            # final_motion_feat = self.cross_attn_norm(final_motion_feat)
+            # final_motion_feat = temporal_input_embedded
+            # 取当前有效行人的场景特征
+            scene_feat = current_scene_feat_all[node_index]  # (N_curr, 32)
+            # 门控融合
+            gate = self.scene_gate(torch.cat([temporal_input_embedded, scene_feat], dim=1))
+            final_motion_feat = temporal_input_embedded + gate * scene_feat
+            noise_to_cat = noise.repeat(final_motion_feat.shape[0], 1)
+            temporal_input_embedded_wnoise = torch.cat((
+                final_motion_feat, 
+                noise_to_cat), dim=1)
+        
+            outputs_current = self.output_layer(temporal_input_embedded_wnoise)
+            # outputs_current = self.output_layer(temporal_input_embedded_wnoise)
+            outputs[framenum, node_index] = outputs_current
+            GM[framenum, node_index] = final_motion_feat
+
+        return outputs
