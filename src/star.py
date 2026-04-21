@@ -371,7 +371,20 @@ class STAR(torch.nn.Module):
 # )
         # --- [3] 输出层 ---
         # 经过 Transformer 后维度依然是 112，最后映射到 2
-        self.output_layer = nn.Linear(32+16, 2)
+        # 占据图采样后的特征维度：4×4 邻域 = 16 个值
+        # self.occ_patch_size = 4
+        # self.occ_feat_dim = self.occ_patch_size ** 2  # 16
+        # self.occ_projector = nn.Sequential(
+        #     nn.Linear(self.occ_feat_dim, 16),
+        #     nn.ReLU(),
+        #     nn.Linear(16, 8),
+        # )
+        # # 初始化最后一层权重为 0，让模型先学会忽略这个分支
+        # nn.init.zeros_(self.occ_projector[-1].weight)
+        # nn.init.zeros_(self.occ_projector[-1].bias)
+        # # 修改输出层：原来 32+16=48, 现在加 8
+        # self.output_layer = nn.Linear(32 + 16 + 8, 2)
+        self.output_layer = nn.Linear(32 + 16 , 2)
         # ReLU and dropout init
         self.relu = nn.ReLU()
         self.dropout_in = nn.Dropout(self.dropout_prob)
@@ -456,17 +469,86 @@ class STAR(torch.nn.Module):
             node_abs[st:ed, :, 1] = (node_abs[st:ed, :, 1] - mean_y)
 
         return node_abs.permute(1, 0, 2)
-
+    def sample_occupancy(self, abs_pos_rotated, occ_map, bounds, theta, patch_size=4):
+        """
+        abs_pos:  (N, 2) 世界坐标
+        occ_map:  (1, 1, H, W)  软概率图
+        bounds:   (4,) = (xmin, xmax, ymin, ymax)
+        返回:     (N, patch_size * patch_size) 局部可走性
+        """
+        # 先把旋转后的坐标反转回原坐标系
+        cos_th = torch.cos(-theta)
+        sin_th = torch.sin(-theta)
+        x = abs_pos_rotated[:, 0] * cos_th - abs_pos_rotated[:, 1] * sin_th
+        y = abs_pos_rotated[:, 0] * sin_th + abs_pos_rotated[:, 1] * cos_th
+        abs_pos = torch.stack([x, y], dim=1)
+        xmin, xmax, ymin, ymax = bounds[0], bounds[1], bounds[2], bounds[3]
+         
+        # # ↓↓↓ 临时调试：打印原始坐标和 bounds ↓↓↓
+        # if torch.rand(1).item() < 0.003:
+        #     print(f'  [RAW] theta={theta.item():.3f}')
+        #     print(f'        rotated_pos x=[{abs_pos_rotated[:,0].min().item():.2f}, {abs_pos_rotated[:,0].max().item():.2f}] '
+        #         f'y=[{abs_pos_rotated[:,1].min().item():.2f}, {abs_pos_rotated[:,1].max().item():.2f}]')
+        #     print(f'        unrot_pos   x=[{x.min().item():.2f}, {x.max().item():.2f}] '
+        #         f'y=[{y.min().item():.2f}, {y.max().item():.2f}]')
+        #     print(f'        bounds      xmin={xmin.item():.2f} xmax={xmax.item():.2f} '
+        #         f'ymin={ymin.item():.2f} ymax={ymax.item():.2f}')
+        #     out_of_bounds = ((x < xmin) | (x > xmax) | (y < ymin) | (y > ymax)).sum().item()
+        #     print(f'        out_of_bounds count = {out_of_bounds} / {x.shape[0]}')
+        # # ↑↑↑ 调试 ↑↑↑
+        # zero_count = ((abs_pos_rotated == 0).all(dim=1)).sum().item()
+        # if zero_count > 0:
+        #     print(f'  [WARN] {zero_count}/{abs_pos_rotated.shape[0]} 行人是 (0,0) 占位符！')
+        
+        # 世界坐标 → [-1, 1]（grid_sample 标准）
+        grid_x = (abs_pos[:, 0] - xmin) / (xmax - xmin) * 2.0 - 1.0
+        grid_y = (abs_pos[:, 1] - ymin) / (ymax - ymin) * 2.0 - 1.0
+        # grid_x = torch.clamp(grid_x, -1.0, 1.0) 
+        grid_x = torch.tanh(grid_x)
+        # grid_y = torch.clamp(grid_y, -1.0, 1.0)
+        grid_y = torch.tanh(grid_y)
+        # 生成 patch_size × patch_size 的采样网格，中心在行人位置
+        N = abs_pos.shape[0]
+        # offsets = torch.linspace(-0.03, 0.03, patch_size, device=abs_pos.device)  # 小邻域
+        if patch_size == 1:
+            offsets = torch.zeros(1, device=abs_pos.device)   # 单点采样，中心
+        else:
+            offsets = torch.linspace(-0.03, 0.03, patch_size, device=abs_pos.device)
+        dx, dy = torch.meshgrid(offsets, offsets, indexing='xy')
+        dx = dx.reshape(-1)  # (patch_size*patch_size,)
+        dy = dy.reshape(-1)
+        
+        grid_x_patch = grid_x.unsqueeze(1) + dx.unsqueeze(0)  # (N, P*P)
+        grid_y_patch = grid_y.unsqueeze(1) + dy.unsqueeze(0)
+        grid_x_patch = torch.clamp(grid_x_patch, -1.0, 1.0)
+        grid_y_patch = torch.clamp(grid_y_patch, -1.0, 1.0)
+        
+        grid = torch.stack([grid_x_patch, grid_y_patch], dim=-1)  # (N, P*P, 2)
+        grid = grid.view(1, N, patch_size * patch_size, 2)        # (1, N, P*P, 2)
+        
+        # occ_map: (1, 1, H, W) → sample
+        sampled = F.grid_sample(occ_map, grid, align_corners=True)  # (1, 1, N, P*P)
+        sampled = sampled.squeeze(0).squeeze(0)                     # (N, P*P)
+        # # 偶发性调试打印
+        # if torch.rand(1).item() < 0.005:
+        #     print(f'  [occ_sample] theta={theta.item():.3f}, '
+        #         f'grid_x range=[{grid_x.min().item():.2f}, {grid_x.max().item():.2f}], '
+        #         f'grid_y range=[{grid_y.min().item():.2f}, {grid_y.max().item():.2f}], '
+        #         f'sampled mean={sampled.mean().item():.3f}, max={sampled.max().item():.3f}')
+    
+        return sampled
     def forward(self, inputs, iftest=False):
        
         # 4. 数据解包
-        if len(inputs) == 8:
-            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum, scene_img = inputs
+        if len(inputs) == 11:
+            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum, scene_img , occ_map, bounds,theta = inputs
+            theta = theta[0] if theta.dim() > 0 else theta #标量化
         else:
-            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum = inputs[:7]
+            nodes_abs, nodes_norm, shift_value, seq_list, nei_lists, nei_num, batch_pednum , occ_map, bounds,theta= inputs[:10]
             scene_img = None
+            theta = None
         num_Ped = nodes_norm.shape[1]
-
+        walk_rewards = []  # 收集所有预测帧的 reward
         outputs = torch.zeros(nodes_norm.shape[0], num_Ped, 2).cuda()
         GM = torch.zeros(nodes_norm.shape[0], num_Ped, 32).cuda()
 
@@ -638,14 +720,25 @@ class STAR(torch.nn.Module):
             # 门控融合
             gate = self.scene_gate(torch.cat([temporal_input_embedded, scene_feat], dim=1))
             final_motion_feat = temporal_input_embedded + gate * scene_feat
+
+           
+
             noise_to_cat = noise.repeat(final_motion_feat.shape[0], 1)
-            temporal_input_embedded_wnoise = torch.cat((
-                final_motion_feat, 
-                noise_to_cat), dim=1)
-        
+            temporal_input_embedded_wnoise = torch.cat((final_motion_feat, noise_to_cat), dim=1)
+
             outputs_current = self.output_layer(temporal_input_embedded_wnoise)
-            # outputs_current = self.output_layer(temporal_input_embedded_wnoise)
             outputs[framenum, node_index] = outputs_current
             GM[framenum, node_index] = final_motion_feat
-
+             # 仅训练阶段 & 预测帧上：用"模型预测的绝对位置"采样 occupancy
+            # 这样 reward 对模型参数是可微的，-λ*reward 才有梯度
+            if not iftest and framenum >= self.args.obs_length:
+                pred_abs_pos = shift_value[framenum, node_index] + outputs_current
+                # pred_abs_pos 带梯度，链回 outputs_current -> output_layer -> ...
+                occ_val = self.sample_occupancy(
+                    pred_abs_pos, occ_map, bounds, theta, patch_size=1
+                )
+                walk_rewards.append(occ_val.mean())
+        if not iftest and len(walk_rewards) > 0:
+            reward = torch.stack(walk_rewards).mean()
+            return outputs, reward
         return outputs

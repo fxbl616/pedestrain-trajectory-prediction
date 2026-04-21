@@ -1,3 +1,7 @@
+两个都加了，
+----epoch 99, train_loss=0.00422, ADE=0.250, FDE=0.657, Best_ADE=0.205, Best_FDE=0.452 at Epoch 65
+epoch 99, train_loss=0.00214, ADE=0.306, FDE=0.771, Best_ADE=0.202, Best_FDE=0.440 at Epoch 74
+
 epoch 87, train_loss=0.00671, ADE=0.625, FDE=1.552, Best_ADE=0.249, Best_FDE=0.563 at Epoch 76
 
 efficientNet 

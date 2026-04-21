@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
+import scipy.ndimage  # 需要 pip install scipy
 DATASET_NAME_TO_NUM = {
     'eth': 0,
     'hotel': 1,
@@ -39,6 +40,7 @@ class Trajectory_Dataloader():
             # STAR 的数据集映射比较隐晦，这里我们根据文件夹名来匹配图片
             # 假设每个数据集目录下都有 reference.png
             self._load_scene_images()
+           
             # Data directory where the pre-processed pickle file resides
             self.data_dir = './data'
             skip = [6, 10, 10, 10, 10, 10, 10, 10]
@@ -48,19 +50,22 @@ class Trajectory_Dataloader():
             assert args.test_set in DATASET_NAME_TO_NUM.keys(), 'Unsupported dataset {}'.format(args.test_set)
 
             args.test_set = DATASET_NAME_TO_NUM[args.test_set]
-
+            
             if args.test_set == 4 or args.test_set == 5:
                 self.test_set = [4, 5]
             else:
                 self.test_set = [self.args.test_set]
-
+            self.train_set_indices = train_set   # 形如 [0, 2, 3, 4, 5, 6, 7]
+            self.test_set_indices = self.test_set
+           
             for x in self.test_set:
                 train_set.remove(x)
-
+            
             self.train_dir = [self.data_dirs[x] for x in train_set]
             self.test_dir = [self.data_dirs[x] for x in self.test_set]
             self.trainskip = [skip[x] for x in train_set]
             self.testskip = [skip[x] for x in self.test_set]
+            self._build_occupancy_maps(grid_size=64)
         else:
             raise NotImplementedError
 
@@ -93,7 +98,115 @@ class Trajectory_Dataloader():
         self.reset_batch_pointer(set='train', valid=False)
         self.reset_batch_pointer(set='train', valid=True)
         self.reset_batch_pointer(set='test', valid=False)
+        print("\n[DEBUG] scene_bounds 汇总：")
+        for sid, b in self.scene_bounds.items():
+            print(f"  set_id={sid}, data_dir={self.data_dirs[sid]}, bounds={b}")
+        print(f"  test_set = {self.args.test_set}\n")
+
+    def _build_occupancy_maps(self, grid_size=64, margin_ratio=0.1, 
+                            gaussian_sigma=3.0, threshold_percentile=10):
+        """
+        为每个训练场景生成 (grid_size, grid_size) 的可走区域软概率图。
+        只遍历 train_set_indices，测试场景（例如 hotel）不建图，避免信息泄露。
+        """
+        cache_path = os.path.join(self.args.save_dir, 
+                                f"occupancy_maps_{self.args.test_set}.pkl")
         
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                self.occupancy_maps, self.scene_bounds = pickle.load(f)
+            print("从缓存加载占据图")
+            return
+        
+        self.occupancy_maps = {}
+        self.scene_bounds = {}
+        
+        # 注意：遍历所有场景，但计数时要区分是不是测试集
+        # 测试集场景的占据图可以用该场景自己的数据构建吗？答案：不能用训练时没见过的轨迹
+        # 但测试场景本身通常没出现在训练集里（留一法），所以这种场景我们:
+        #   方案 A（推荐）: 用所有其他场景的聚合数据，作为 generic prior（可能不够精确）
+        #   方案 B（实用）: 直接用该测试场景自己的轨迹，因为 occupancy 是场景静态属性，
+        #                  这算"场景知识"而非"标签泄露"（学界常见做法）
+        # 下面代码按方案 B 实现
+        
+        for set_id in self.train_set_indices:
+            dir_path = self.data_dirs[set_id]
+            # 读取该场景所有轨迹
+            traj_dict = self._load_single_scene_trajectories(set_id)
+            
+            # 收集所有 (x, y) 点
+            all_points = []
+            for ped_id, trajec in traj_dict.items():
+                valid = trajec[:, 1:3]  # (T, 2)
+                valid = valid[~np.all(valid == 0, axis=1)]  # 过滤 0 点
+                all_points.append(valid)
+            
+            if len(all_points) == 0:
+                print(f"场景 {set_id} 没有轨迹数据")
+                continue
+            
+            all_points = np.concatenate(all_points, axis=0)  # (N_total, 2)
+            
+            # 计算坐标范围，加 margin
+            xmin, xmax = all_points[:, 0].min(), all_points[:, 0].max()
+            ymin, ymax = all_points[:, 1].min(), all_points[:, 1].max()
+            x_range = xmax - xmin
+            y_range = ymax - ymin
+            xmin -= x_range * margin_ratio
+            xmax += x_range * margin_ratio
+            ymin -= y_range * margin_ratio
+            ymax += y_range * margin_ratio
+            
+            # 离散化到网格
+            count_map = np.zeros((grid_size, grid_size), dtype=np.float32)
+            x_idx = ((all_points[:, 0] - xmin) / (xmax - xmin) * (grid_size - 1)).astype(int)
+            y_idx = ((all_points[:, 1] - ymin) / (ymax - ymin) * (grid_size - 1)).astype(int)
+            x_idx = np.clip(x_idx, 0, grid_size - 1)
+            y_idx = np.clip(y_idx, 0, grid_size - 1)
+            for xi, yi in zip(x_idx, y_idx):
+                count_map[yi, xi] += 1  # 注意 [y, x] 和图像约定一致
+            
+            # 高斯平滑，填补稀疏孤立点
+            smoothed = scipy.ndimage.gaussian_filter(count_map, sigma=gaussian_sigma)
+            
+            # 归一化到 [0, 1]，做成软概率图（而不是硬二值）
+            if smoothed.max() > 0:
+                smoothed = smoothed / smoothed.max()
+            # 新增：加一个软地板
+            smoothed = np.maximum(smoothed, 0.05)   # 任何地方至少 0.05
+            # 可选：保留二值版本作为参考
+            # threshold = np.percentile(smoothed[smoothed > 0], threshold_percentile)
+            # binary = (smoothed > threshold).astype(np.float32)
+            
+            self.occupancy_maps[set_id] = torch.from_numpy(smoothed)
+            self.scene_bounds[set_id] = (xmin, xmax, ymin, ymax)
+            
+            print(f"场景 {set_id} ({os.path.basename(dir_path)}): "
+                f"点数={len(all_points)}, 坐标范围=x[{xmin:.1f},{xmax:.1f}] "
+                f"y[{ymin:.1f},{ymax:.1f}], 覆盖率={(smoothed > 0).mean():.2%}")
+            nonzero = (smoothed > 0.01).mean()
+            high = (smoothed > 0.3).mean()
+            print(f'场景 {set_id}: >0.01 占比={nonzero:.2%}, >0.3 占比={high:.2%}, mean={smoothed.mean():.4f}')
+        
+        # 缓存
+        with open(cache_path, 'wb') as f:
+            pickle.dump((self.occupancy_maps, self.scene_bounds), f)
+
+
+    def _load_single_scene_trajectories(self, set_id):
+        """辅助函数：读取单个场景的所有轨迹"""
+        file_path = os.path.join(self.data_dirs[set_id], 'true_pos_.csv')
+        data = np.genfromtxt(file_path, delimiter=',')
+        traj_dict = {}
+        Pedlist = np.unique(data[1, :]).tolist()
+        for pedi in Pedlist:
+            frames = data[:, data[1, :] == pedi]
+            traj = []
+            for i in range(frames.shape[1]):
+                # 注意：STAR 的 csv 格式是 frame, pedid, y, x（data[2]=y, data[3]=x）
+                traj.append([int(frames[0, i]), frames[3, i], frames[2, i]])
+            traj_dict[pedi] = np.array(traj)
+        return traj_dict    
     def _load_scene_images(self):
         """加载并预处理所有场景图片"""
         print("正在加载场景图片...")
@@ -475,7 +588,7 @@ class Trajectory_Dataloader():
         Random ration and zero shifting.
         '''
         batch, seq_list, nei_list, nei_num, batch_pednum = batch_data
-
+        th = 0.0
         # rotate batch
         if ifrotate:
             th = random.random() * np.pi
@@ -488,19 +601,16 @@ class Trajectory_Dataloader():
         shift_value = np.repeat(s.reshape((1, -1, 2)), self.args.seq_length, 0)
 
         batch_data = batch, batch - shift_value, shift_value, seq_list, nei_list, nei_num, batch_pednum
-        return batch_data
+        return batch_data, th
 
     def get_train_batch(self, idx):
         batch_data, batch_id = self.trainbatch[idx]
-        batch_data = self.rotate_shift_batch(batch_data, ifrotate=self.args.randomRotate)
+        batch_data, theta = self.rotate_shift_batch(batch_data, ifrotate=self.args.randomRotate)
         
-        # 提取图片逻辑：batch_id 是一个 list [(set_id, frame_id), ...]
-        # 我们取第一个 set_id 来获取图片 (通常 STAR 的 batch 来自同一数据集或我们假设它主要受该数据集场景影响)
-        set_id = batch_id[0][0]
-        # 注意: self.train_dir 存储的是路径，我们需要映射回原始的 data_dirs 索引
-        # 这里为了简化，我们假设 train_set 的顺序和 self.train_dir 一致，但因为 self.train_dir 是被过滤过的
-        # 我们需要从 batch_id 里的 set_id 直接获取图片。batch_id 里的 set_id 是 dataPreprocess 里生成的，
-        # 对应的是原始 data_dirs 的索引。
+        # batch_id[0][0] 是 train_dir/test_dir 的相对索引，需要映射回 data_dirs 的原始索引
+        relative_set_id = batch_id[0][0]                          # 0~6 (train_dir 索引)
+        set_id = self.train_set_indices[relative_set_id] 
+        
         
         scene_img = self.scene_images.get(set_id)
         if scene_img is None:
@@ -508,22 +618,29 @@ class Trajectory_Dataloader():
             
         # 扩展维度 (1, C, H, W)
         scene_img = scene_img.unsqueeze(0)
-            
+        # 新增：占据图和坐标范围
+        occ_map = self.occupancy_maps.get(set_id, torch.zeros(64, 64)).unsqueeze(0).unsqueeze(0)  # (1, 1, 64, 64)
+        # print(f"  [取 batch] set_id={set_id}, data_dir={self.data_dirs[set_id]}")
+        bounds = torch.tensor(self.scene_bounds.get(set_id, (-10, 10, -10, 10)))  # (4,)
         # 将图片添加到返回值元组的末尾
-        return batch_data + (scene_img,), batch_id
+        return batch_data + (scene_img, occ_map, bounds, torch.tensor([theta])), batch_id
 
     def get_test_batch(self, idx):
         batch_data, batch_id = self.testbatch[idx]
-        batch_data = self.rotate_shift_batch(batch_data, ifrotate=False)
+        batch_data,theta = self.rotate_shift_batch(batch_data, ifrotate=False)
         
-        set_id = batch_id[0][0]
+        relative_set_id = batch_id[0][0]                          # 0~6 (train_dir 索引)
+        set_id = self.test_set_indices[relative_set_id] 
         scene_img = self.scene_images.get(set_id)
         if scene_img is None:
             scene_img = torch.zeros(3, 224, 224)
             
         scene_img = scene_img.unsqueeze(0)
-        
-        return batch_data + (scene_img,), batch_id
+        # 新增：占据图和坐标范围
+        occ_map = self.occupancy_maps.get(set_id, torch.zeros(64, 64)).unsqueeze(0).unsqueeze(0)  # (1, 1, 64, 64)
+        # print(f"  [取 batch] set_id={set_id}, data_dir={self.data_dirs[set_id]}")
+        bounds = torch.tensor(self.scene_bounds.get(set_id, (-10, 10, -10, 10)))  # (4,)
+        return batch_data + (scene_img, occ_map, bounds, torch.tensor([theta])), batch_id
 
     def reset_batch_pointer(self, set, valid=False):
         '''

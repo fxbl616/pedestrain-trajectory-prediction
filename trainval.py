@@ -1,6 +1,8 @@
 import argparse
 import ast
 import os
+import random
+import numpy as np
 # import os
 # 强行指定架构为 Compute Capability 9.0 (Ada Lovelace, RTX 40系标准)
 # 这样 PyTorch 就会用兼容模式运行，通常能完美解决 RTX 50 系的问题
@@ -12,9 +14,28 @@ import yaml
 from src.processor import processor
 
 # Use Deterministic mode and set random seed
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-torch.manual_seed(0)
+def seed_everything(seed=0):
+    # 1. 锁 Python 自带的随机种子
+    random.seed(seed)
+    
+    # 2. 锁 Numpy 的随机种子
+    np.random.seed(seed)
+    
+    # 3. 锁 PyTorch 的随机种子（CPU 和 GPU）
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed) # 如果你有多个 GPU，这一句必须加
+    
+    # 4. 锁底层 CuDNN 算法的随机性（你提到的那两句）
+    # 这一步会稍微拖慢一点点训练速度，但为了复现是必须的
+    torch.backends.cudnn.deterministic = True 
+    torch.backends.cudnn.benchmark = False
+    
+    # 5. 额外保险：锁 Python hash 算法的随机性（部分早期 Python 版本适用）
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+# 在主程序开头直接调用
+seed_everything(3407) #0 42 3407
 
 
 def get_parser():
@@ -47,10 +68,12 @@ def get_parser():
     parser.add_argument('--ifsave_results', default=False, type=ast.literal_eval)
     parser.add_argument('--randomRotate', default=True, type=ast.literal_eval,
                         help="=True:random rotation of each trajectory fragment")
+    parser.add_argument('--lambda_walk', default=0.02, type=float)                    
     parser.add_argument('--neighbor_thred', default=10, type=int)
     parser.add_argument('--learning_rate', default=0.0015, type=float)
     parser.add_argument('--clip', default=1, type=int)
-
+    parser.add_argument('--use_occ_input', type=bool, default=False)  # 方案 A: True, 方案 B: False
+    parser.add_argument('--use_occ_reward', type=bool, default=True)  # 方案 A/B 都 True, baseline: False
     return parser
 
 

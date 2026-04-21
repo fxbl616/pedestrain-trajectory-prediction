@@ -60,7 +60,7 @@ class processor(object):
 
     def set_optimizer(self):
 
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.args.learning_rate)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.args.learning_rate, weight_decay=1e-4)
         self.criterion = nn.MSELoss(reduction='none')
 
     def test(self):
@@ -120,18 +120,21 @@ class processor(object):
             inputs = tuple([i.cuda() for i in inputs])
 
             loss = torch.zeros(1).cuda()
-            batch_abs, batch_norm, shift_value, seq_list, nei_list, nei_num, batch_pednum, scene_img = inputs
+            batch_abs, batch_norm, shift_value, seq_list, nei_list, nei_num, batch_pednum, scene_img, occ_map, bounds, theta = inputs
             inputs_forward = batch_abs[:-1], batch_norm[:-1], shift_value[:-1], seq_list[:-1], nei_list[:-1], nei_num[
-                                                                                                              :-1], batch_pednum, scene_img
+                                                                                                              :-1], batch_pednum, scene_img, occ_map, bounds, theta
 
             self.net.zero_grad()
 
-            outputs = self.net.forward(inputs_forward, iftest=False)
+            outputs, reward = self.net.forward(inputs_forward, iftest=False)
+           
 
             lossmask, num = getLossMask(outputs, seq_list[0], seq_list[1:], using_cuda=self.args.using_cuda)
             loss_o = torch.sum(self.criterion(outputs, batch_norm[1:, :, :2]), dim=2)
-
-            loss += (torch.sum(loss_o * lossmask / num))
+            mse_loss = torch.sum(loss_o * lossmask / num)
+            reward_term = self.args.lambda_walk * reward
+            loss = mse_loss - reward_term   # 奖励项，减号
+            # loss += (torch.sum(loss_o * lossmask / num))
             loss_epoch += loss.item()
 
             loss.backward()
@@ -144,9 +147,12 @@ class processor(object):
 
             if batch % self.args.show_step == 0 and self.args.ifshow_detail:
                 print(
-                    'train-{}/{} (epoch {}), train_loss = {:.5f}, time/batch = {:.5f} '.format(batch,
+                    'train-{}/{} (epoch {}), train_loss = {:.5f}, mse={:.5f}, reward={:.5f}, reward_term={:.5f}, time/batch = {:.5f} '.format(batch,
                                                                                                self.dataloader.trainbatchnums,
                                                                                                epoch, loss.item(),
+                                                                                               mse_loss.item(),
+                                                                                               reward.item(),
+                                                                                               reward_term.item(),
                                                                                                end - start))
 
         train_loss_epoch = loss_epoch / self.dataloader.trainbatchnums
@@ -166,10 +172,10 @@ class processor(object):
             if self.args.using_cuda:
                 inputs = tuple([i.cuda() for i in inputs])
 
-            batch_abs, batch_norm, shift_value, seq_list, nei_list, nei_num, batch_pednum, scene_img = inputs
+            batch_abs, batch_norm, shift_value, seq_list, nei_list, nei_num, batch_pednum, scene_img, occ_map, bounds, theta = inputs
 
             inputs_forward = batch_abs[:-1], batch_norm[:-1], shift_value[:-1], seq_list[:-1], nei_list[:-1], nei_num[
-                                                                                                              :-1], batch_pednum, scene_img
+                                                                                                              :-1], batch_pednum, scene_img, occ_map, bounds, theta
 
             all_output = []
             for i in range(self.args.sample_num):
