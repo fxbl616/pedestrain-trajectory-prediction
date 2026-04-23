@@ -34,8 +34,7 @@ def seed_everything(seed=0):
     # 5. 额外保险：锁 Python hash 算法的随机性（部分早期 Python 版本适用）
     os.environ['PYTHONHASHSEED'] = str(seed)
 
-# 在主程序开头直接调用
-seed_everything(3407) #0 42 3407
+
 
 
 def get_parser():
@@ -68,12 +67,18 @@ def get_parser():
     parser.add_argument('--ifsave_results', default=False, type=ast.literal_eval)
     parser.add_argument('--randomRotate', default=True, type=ast.literal_eval,
                         help="=True:random rotation of each trajectory fragment")
-    parser.add_argument('--lambda_walk', default=0.02, type=float)                    
+    parser.add_argument('--lambda_walk', default=0.02, type=float)
+    parser.add_argument('--seed', default=3407, type=int,
+                        help='random seed for reproducibility')
+    parser.add_argument('--use_scene', default=False, type=ast.literal_eval,
+                        help='=True: enable EfficientNet scene encoder + scene_gate')                    
     parser.add_argument('--neighbor_thred', default=10, type=int)
     parser.add_argument('--learning_rate', default=0.0015, type=float)
     parser.add_argument('--clip', default=1, type=int)
-    parser.add_argument('--use_occ_input', type=bool, default=False)  # 方案 A: True, 方案 B: False
-    parser.add_argument('--use_occ_reward', type=bool, default=True)  # 方案 A/B 都 True, baseline: False
+    parser.add_argument('--use_occ_input', type=ast.literal_eval, default=False,
+                        help='(reserved) conservative branch: occupancy as input feature')
+    parser.add_argument('--use_occ_reward', type=ast.literal_eval, default=True,
+                        help='=True: aggressive branch, use occupancy as training reward')
     return parser
 
 
@@ -117,7 +122,8 @@ if __name__ == '__main__':
         save_arg(p)
 
     args = load_arg(p)
-
+    # 在主程序开头直接调用
+    seed_everything(args.seed) #0 42 3407
     torch.cuda.set_device(0)
   
     trainer = processor(args)

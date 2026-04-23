@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.txt
 /output/
+*.log
+/output_smoke_baseline/
+/output_smoke_reward/

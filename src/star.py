@@ -316,14 +316,21 @@ class STAR(torch.nn.Module):
         # Linear layer to output and fusion
         # self.output_layer = nn.Linear(48 + self.vit_dim, 2)
         # [新增] 初始化 ViT
-        
-        self.scene_encoder = ViTSceneEncoder(embedding_dim=self.vit_dim,
-            embed_dim=256,      # 减小维度，防止过拟合 (原来是768)
-            num_layers=4,       # 减少层数 (原来是12)
-            num_heads=4,        # 减少头数
-            freeze_vit=True,   # 冻结预训练权重
-            use_multi_scale=True)
-
+         # 条件构建 scene encoder：仅 use_scene=True 时初始化
+        if getattr(self.args, 'use_scene', False):
+            self.scene_encoder = ViTSceneEncoder(embedding_dim=self.vit_dim,
+                embed_dim=256,      # 减小维度，防止过拟合 (原来是768)
+                num_layers=4,       # 减少层数 (原来是12)
+                num_heads=4,        # 减少头数
+                freeze_vit=True,   # 冻结预训练权重
+                use_multi_scale=True)
+            self.scene_gate = nn.Sequential(
+                nn.Linear(self.vit_dim + 32, self.vit_dim),
+                nn.Sigmoid()
+            )
+        else:
+            self.scene_encoder = None
+            self.scene_gate = None
         # [修改] Fusion Layer: Temporal(32) + Spatial(32) = 64
         self.fusion_layer = nn.Linear(32 + 32, 32)
         # self.fusion_layer = nn.Linear(64, 32)
@@ -361,10 +368,7 @@ class STAR(torch.nn.Module):
         # self.cross_attn = nn.MultiheadAttention(embed_dim=self.fusion_dim, num_heads=4, dropout=0.1)
         # self.cross_attn_norm = nn.LayerNorm(self.fusion_dim)
         
-        self.scene_gate = nn.Sequential(
-            nn.Linear(self.vit_dim + 32, self.vit_dim),
-            nn.Sigmoid()
-        )
+       
 # self.motion_gate = nn.Sequential(
 #     nn.Linear(self.vit_dim + 32, self.vit_dim),
 #     nn.Sigmoid()
@@ -556,7 +560,8 @@ class STAR(torch.nn.Module):
         # [新增] 提取场景特征
         # scene_img shape: (1, 3, 224, 224) -> feature: (1, 64)
         # 5. ViT 前向传播
-        if scene_img is not None:
+        use_scene = getattr(self.args, 'use_scene', False) and (self.scene_encoder is not None) and (scene_img is not None)
+        if use_scene:
             if scene_img.device != nodes_abs.device:
                 scene_img = scene_img.to(nodes_abs.device)
             
@@ -585,7 +590,7 @@ class STAR(torch.nn.Module):
             # current_scene_feat_all = torch.repeat_interleave(batch_scene_feat, bp_tensor.long(), dim=0)
         else:
             # current_scene_feat_all = torch.zeros(num_Ped, self.vit_dim, 14, 14).cuda()
-            current_scene_feat_all = torch.zeros(num_Ped, self.vit_dim).cuda()
+            current_scene_feat_all = None  # 显式不用
         for framenum in range(self.args.seq_length - 1):
 
             if framenum >= self.args.obs_length and iftest:
@@ -716,10 +721,13 @@ class STAR(torch.nn.Module):
             # final_motion_feat = self.cross_attn_norm(final_motion_feat)
             # final_motion_feat = temporal_input_embedded
             # 取当前有效行人的场景特征
-            scene_feat = current_scene_feat_all[node_index]  # (N_curr, 32)
-            # 门控融合
-            gate = self.scene_gate(torch.cat([temporal_input_embedded, scene_feat], dim=1))
-            final_motion_feat = temporal_input_embedded + gate * scene_feat
+            if use_scene:
+                scene_feat = current_scene_feat_all[node_index]  # (N_curr, 32)
+                # 门控融合
+                gate = self.scene_gate(torch.cat([temporal_input_embedded, scene_feat], dim=1))
+                final_motion_feat = temporal_input_embedded + gate * scene_feat
+            else:
+                final_motion_feat = temporal_input_embedded
 
            
 
@@ -731,14 +739,20 @@ class STAR(torch.nn.Module):
             GM[framenum, node_index] = final_motion_feat
              # 仅训练阶段 & 预测帧上：用"模型预测的绝对位置"采样 occupancy
             # 这样 reward 对模型参数是可微的，-λ*reward 才有梯度
-            if not iftest and framenum >= self.args.obs_length:
+            if (not iftest 
+                and getattr(self.args, 'use_occ_reward', False) 
+                and framenum >= self.args.obs_length):
                 pred_abs_pos = shift_value[framenum, node_index] + outputs_current
                 # pred_abs_pos 带梯度，链回 outputs_current -> output_layer -> ...
                 occ_val = self.sample_occupancy(
                     pred_abs_pos, occ_map, bounds, theta, patch_size=1
                 )
                 walk_rewards.append(occ_val.mean())
-        if not iftest and len(walk_rewards) > 0:
-            reward = torch.stack(walk_rewards).mean()
+         # 训练时统一返回 (outputs, reward)，reward=0 表示 disabled
+        if not iftest:
+            if len(walk_rewards) > 0:
+                reward = torch.stack(walk_rewards).mean()
+            else:
+                reward = torch.tensor(0.0, device=outputs.device)
             return outputs, reward
         return outputs

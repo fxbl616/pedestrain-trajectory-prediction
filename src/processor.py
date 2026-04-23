@@ -132,9 +132,12 @@ class processor(object):
             lossmask, num = getLossMask(outputs, seq_list[0], seq_list[1:], using_cuda=self.args.using_cuda)
             loss_o = torch.sum(self.criterion(outputs, batch_norm[1:, :, :2]), dim=2)
             mse_loss = torch.sum(loss_o * lossmask / num)
-            reward_term = self.args.lambda_walk * reward
-            loss = mse_loss - reward_term   # 奖励项，减号
-            # loss += (torch.sum(loss_o * lossmask / num))
+            if getattr(self.args, 'use_occ_reward', False):
+                reward_term = self.args.lambda_walk * reward
+                loss = mse_loss - reward_term
+            else:
+                reward_term = torch.tensor(0.0, device=mse_loss.device)
+                loss = mse_loss
             loss_epoch += loss.item()
 
             loss.backward()
@@ -146,14 +149,14 @@ class processor(object):
             end = time.time()
 
             if batch % self.args.show_step == 0 and self.args.ifshow_detail:
-                print(
-                    'train-{}/{} (epoch {}), train_loss = {:.5f}, mse={:.5f}, reward={:.5f}, reward_term={:.5f}, time/batch = {:.5f} '.format(batch,
-                                                                                               self.dataloader.trainbatchnums,
-                                                                                               epoch, loss.item(),
-                                                                                               mse_loss.item(),
-                                                                                               reward.item(),
-                                                                                               reward_term.item(),
-                                                                                               end - start))
+                msg = ('train-{}/{} (epoch {}), loss={:.5f}, mse={:.5f}'
+                       .format(batch, self.dataloader.trainbatchnums, epoch,
+                               loss.item(), mse_loss.item()))
+                if getattr(self.args, 'use_occ_reward', False):
+                    msg += ', reward={:.5f}, reward_term={:.5f}'.format(
+                        reward.item(), reward_term.item())
+                msg += ', time/batch={:.5f}'.format(end - start)
+                print(msg)
 
         train_loss_epoch = loss_epoch / self.dataloader.trainbatchnums
         return train_loss_epoch

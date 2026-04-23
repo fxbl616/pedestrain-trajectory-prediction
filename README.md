@@ -1,3 +1,4 @@
+----epoch 99, train_loss=0.00385, ADE=0.722, FDE=1.854, Best_ADE=0.318, Best_FDE=0.712 at Epoch 88 在zara1 上
 两个都加了，
 ----epoch 99, train_loss=0.00422, ADE=0.250, FDE=0.657, Best_ADE=0.205, Best_FDE=0.452 at Epoch 65
 epoch 99, train_loss=0.00214, ADE=0.306, FDE=0.771, Best_ADE=0.202, Best_FDE=0.440 at Epoch 74
@@ -41,7 +42,7 @@ The datasets are selected on arguments '--test_set'. Five datasets in ETH/UCY in
 This command is to train model for ETH-hotel and start test at epoch 10. For different dataset, change 'hotel' to other datasets named in the last section.
 
 ```
-python trainval.py --test_set hotel --start_test 50
+nohup python -u trainval.py --test_set hotel --start_test 50 > ./train.log 2>&1 & 
 ```
 
 During training, the model for Best FDE on the corresponding test dataset would be record.
